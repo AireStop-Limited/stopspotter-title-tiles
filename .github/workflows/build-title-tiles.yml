@@ -1,5 +1,16 @@
 name: Build title boundary tiles
 
+# PUBLISH TARGET (changed 13 Nov 2026): tiles are now published to the
+# private S3 bucket `airestop-title-tiles` and served through CloudFront
+# (distribution in repo variable TITLE_TILES_CLOUDFRONT_DISTRIBUTION_ID),
+# not GitHub Release assets. This repo went private, and a private repo's
+# release assets can't be fetched by the edge function's plain fetch().
+# The S3 key layout deliberately mirrors the old release URLs:
+#   s3://airestop-title-tiles/title-tiles-latest-<ew|scotland>-<p>/<nation>_<shardId>.json.gz
+# so the edge function only swaps its base URL. The old GitHub Releases
+# are no longer updated. The history notes below about releases, PATs and
+# the 1,000-asset cap describe the old design and are kept for context.
+
 # Builds the on-demand title-lookup tile set (see
 # docs/TITLE_BOUNDARY_API_PLAN.md) and publishes it as GitHub Release
 # assets. Replaces the old sync-title-boundaries-{ew,scotland}.yml design,
@@ -66,7 +77,8 @@ on:
         default: ''
 
 permissions:
-  contents: write # to create/replace the title-tiles-latest release and its assets
+  contents: read
+  id-token: write # AWS OIDC - assumes the publish role, no long-lived keys
 
 jobs:
   build:
@@ -82,27 +94,6 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-
-      # Real incident (20 Oct 2026): a real --all run built and finalized
-      # every shard correctly (2,291 EW + 1,630 Scotland files), but
-      # Publish failed partway through the 4th of 6 releases with "HTTP
-      # 403: API rate limit exceeded for installation" - the default
-      # GITHUB_TOKEN's own rate limit (undocumented exact figure, but
-      # empirically well under the ~3,900 release-asset-upload calls
-      # NUM_RELEASE_PARTITIONS x 2 nations now needs) ran out partway
-      # through. A real user-owned PAT gets the much higher standard
-      # 5,000/hour authenticated-user limit instead, comfortably covering
-      # this. Checked HERE, before the ~2-hour build, rather than letting
-      # a real --all run spend that time only to fail at Publish again.
-      - name: Verify the release-publish PAT is configured
-        if: inputs.dry_run != 'true' && inputs.council == '' && inputs.county == ''
-        env:
-          HAS_PAT: ${{ secrets.TITLE_TILES_RELEASE_PAT != '' }}
-        run: |
-          if [ "$HAS_PAT" != "true" ]; then
-            echo "TITLE_TILES_RELEASE_PAT repo secret is not set. The default GITHUB_TOKEN's own rate limit isn't enough to publish NUM_RELEASE_PARTITIONS x 2 nations' worth of individual release-asset uploads (3,900+ calls) - confirmed by a real run hitting '403 API rate limit exceeded for installation' partway through. See docs/SETUP.md §15 (in the jamspr95/stopspotter repo) for how to create a fine-grained PAT (Contents: Read & Write, scoped to only this repo) and add it here as this secret." >&2
-            exit 1
-          fi
 
       # continue-on-error: a handful of per-council failures (a transient
       # fetch blip, one outlier council too large to parse — see below)
@@ -207,213 +198,55 @@ jobs:
             exit 1
           fi
 
-      # GitHub Releases cap out at 1000 assets per release (confirmed against
-      # GitHub's own docs, Oct 2026) — checked per nation PER PARTITION,
-      # since each partition now publishes to its own release (see this
-      # workflow's own top-of-file comment for why: FINE_CELLS_PER_SHARD
-      # dropped to 1 - no grouping at all - which on its own would have
-      # quadrupled the single-release-per-nation file count straight past
-      # this cap). Kept as a loud failure rather than a silent truncated
-      # publish if the real count ever drifts past this again; if it
-      # fires, the fix is a larger NUM_RELEASE_PARTITIONS (in both this
-      # repo's copy and supabase/functions/lookup-title-boundary/index.ts's
-      # duplicate), not a workaround here.
-      - name: Check asset counts against GitHub's per-release limit
+      - name: Configure AWS credentials (OIDC)
         if: inputs.dry_run != 'true' && inputs.council == '' && inputs.county == ''
-        run: |
-          NUM_PARTITIONS=3
-          for nation in england_wales scotland; do
-            for p in $(seq 0 $((NUM_PARTITIONS - 1))); do
-              count=$(find "$ASSETS_DIR/$nation/$p" -name '*.json.gz' 2>/dev/null | wc -l)
-              echo "$nation partition $p: $count shard asset(s) to publish."
-              if [ "$count" -gt 950 ]; then
-                echo "$nation partition $p's $count assets would exceed (or come dangerously close to) GitHub's documented 1000-asset-per-release limit." >&2
-                exit 1
-              fi
-            done
-          done
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
 
-      # gh release create takes a list of asset files/patterns and relies on
-      # the CALLING SHELL to expand any glob in them (confirmed against the
-      # installed gh CLI's own --help: "USAGE gh release create [<tag>]
-      # [<filename>... | <pattern>...]", with its own example
-      # `gh release create v1.2.3 ./dist/*.tgz` left unquoted) — it does not
-      # itself walk directories or expand `**`. $ASSETS_DIR/<nation>/<p>/*.json.gz
-      # is a flat, single-level glob (no subdirectories by this point, see
-      # the flatten step above), so plain bash globbing is enough; no
-      # globstar needed.
-      #
-      # NUM_RELEASE_PARTITIONS releases per nation (title-tiles-latest-ew-0/1/2,
-      # title-tiles-latest-scotland-0/1/2) — not one release per nation — so
-      # each stays comfortably under GitHub's 1,000-asset cap on its own
-      # (see this workflow's top-of-file comment). The edge function
-      # computes the same latBucket-mod-partition-count formula to pick
-      # which release to fetch from.
-      # TITLE_TILES_RELEASE_PAT, not the default GITHUB_TOKEN — see the
-      # "Verify the release-publish PAT is configured" step's own comment
-      # for the real incident (403 rate-limit) that made the default
-      # token insufficient here.
-      - name: Publish releases (replaces every title-tiles-latest-{ew,scotland}-N entirely)
+      # One S3 prefix per nation x partition, named exactly like the old
+      # release tags. `sync --delete` uploads new/changed shards and
+      # removes stale ones (a fine cell that produced a shard last time
+      # but not this time). A partition that produced no shards is left
+      # untouched rather than emptied. Content-Type is application/gzip
+      # with NO Content-Encoding, so fetch() hands the edge function the
+      # raw gzip bytes it decompresses itself (DecompressionStream).
+      - name: Publish shards to S3
         if: inputs.dry_run != 'true' && inputs.council == '' && inputs.county == ''
         env:
-          GITHUB_TOKEN: ${{ secrets.TITLE_TILES_RELEASE_PAT }}
+          BUCKET: ${{ vars.AWS_S3_BUCKET }}
         run: |
           set -euo pipefail
           NUM_PARTITIONS=3
-
-          # Real incident (20 Oct 2026): the first version of this retried
-          # `gh release delete` + `gh release create` on failure. Deleting
-          # a POPULATED release (hundreds of assets) turned out to be the
-          # one operation that's actually unreliable here — a real run hit
-          # a persistent `HTTP 502: Server Error` on deleting three
-          # specific releases, for over an hour of retries with backoff,
-          # never once succeeding; `gh release view` kept confirming they
-          # were still there. Retrying harder couldn't fix it, because the
-          # operation itself (not transient network flakiness) seems to be
-          # what's unreliable for a release with this many assets.
-          #
-          # Real fix: never delete a populated release at all. If the tag
-          # already exists, update it in place instead — `gh release
-          # upload --clobber` overwrites/adds assets, `gh release edit`
-          # updates the title/notes, and any STALE asset (a fine cell that
-          # produced a shard last time but not this time) is removed
-          # individually via `gh release delete-asset`, a much smaller,
-          # provenly reliable operation compared to deleting the whole
-          # release object. `gh release create` is only ever used for a
-          # tag that doesn't exist yet, which was never the operation that
-          # failed.
-          upsert_release() {
-            local tag="$1" title="$2"
-            shift 2
-            local assets=("$@")
-            local notes="Built $(date -u +%Y-%m-%d)"
-
-            if ! gh release view "$tag" >/dev/null 2>&1; then
-              gh release create "$tag" "${assets[@]}" --title "$title" --notes "$notes"
-              return $?
-            fi
-
-            gh release edit "$tag" --title "$title" --notes "$notes" || return 1
-
-            # Real incident (21 Oct 2026): re-running this workflow
-            # re-uploaded EVERY asset on every attempt, even ones
-            # byte-identical to what was already published — at ~700
-            # assets per release x 6 releases, that's thousands of
-            # wasted API calls, and is exactly what turned a single
-            # rate-limit hit into an unrecoverable one within the hour
-            # (every retry re-spent the same exhausted quota
-            # re-uploading assets that didn't need it, so it never
-            # actually got closer to finishing). One `gh release view`
-            # call up front, then skip uploading any local file whose
-            # size exactly matches the already-published asset of the
-            # same name — not a byte-for-byte guarantee, but real shard
-            # data only changes when the underlying HMLR/RoS source
-            # changes, which reliably changes a shard's compressed size
-            # too. This also makes a rate-limited retry genuinely
-            # cheaper the second time, not just a doomed repeat.
-            local existing new_assets=() asset base existing_size
-            existing=$(gh release view "$tag" --json assets --jq '.assets[] | "\(.name) \(.size)"')
-            for asset in "${assets[@]}"; do
-              base=$(basename "$asset")
-              existing_size=$(awk -v n="$base" '$1==n {print $2}' <<< "$existing")
-              if [ "$existing_size" = "$(stat -c%s "$asset")" ]; then
-                continue
-              fi
-              new_assets+=("$asset")
-            done
-            if [ "${#new_assets[@]}" -gt 0 ]; then
-              gh release upload "$tag" "${new_assets[@]}" --clobber || return 1
-            fi
-
-            local new_names existing_names stale_names name
-            new_names=$(printf '%s\n' "${assets[@]}" | xargs -n1 basename | sort)
-            existing_names=$(printf '%s\n' "$existing" | awk '{print $1}' | sort)
-            stale_names=$(comm -23 <(echo "$existing_names") <(echo "$new_names"))
-            if [ -n "$stale_names" ]; then
-              while IFS= read -r name; do
-                [ -z "$name" ] && continue
-                gh release delete-asset "$tag" "$name" --yes \
-                  || echo "Could not delete stale asset $name from $tag (non-fatal — it'll just sit there unused)." >&2
-              done <<< "$stale_names"
-            fi
-          }
-
-          # Real incident (21 Oct 2026): a fixed 60/120/180/240/300s
-          # backoff has no idea whether a failure was a genuine
-          # rate-limit (which resets on GitHub's own schedule, often
-          # much later than 5 minutes out) or a transient server error
-          # (which usually clears within seconds) — guessing wrong on a
-          # rate limit meant retrying before quota was actually back,
-          # burning the still-exhausted budget on another failed
-          # attempt, over and over, never recovering within the run.
-          # When a failure specifically says "API rate limit exceeded",
-          # ask GitHub directly when it resets (`gh api rate_limit`) and
-          # sleep until then instead of guessing; any other failure
-          # (502, network blip) keeps the short exponential backoff,
-          # since those really are usually transient.
-          rate_limit_reset_wait() {
-            local reset now wait
-            reset=$(gh api rate_limit --jq '.resources.core.reset' 2>/dev/null) || return 1
-            now=$(date +%s)
-            wait=$((reset - now + 5))
-            if [ "$wait" -gt 0 ]; then
-              echo "Rate limited — waiting ${wait}s for quota to reset (resets $(date -u -d "@$reset" +%H:%M:%S) UTC)..." >&2
-              sleep "$wait"
-            fi
-          }
-
-          publish_one_release() {
-            local tag="$1" title="$2"
-            shift 2
-            local assets=("$@")
-            local attempt logfile
-            logfile=$(mktemp)
-            for attempt in 1 2 3 4 5; do
-              if upsert_release "$tag" "$title" "${assets[@]}" 2>&1 | tee "$logfile"; then
-                rm -f "$logfile"
-                return 0
-              fi
-              if grep -qi "API rate limit exceeded" "$logfile"; then
-                rate_limit_reset_wait
-              else
-                echo "Publishing $tag failed (attempt $attempt/5) - waiting $((attempt * 60))s before retrying, in case this was a transient server error." >&2
-                sleep $((attempt * 60))
-              fi
-            done
-            rm -f "$logfile"
-            echo "Giving up on $tag after 5 attempts." >&2
-            return 1
-          }
-
-          # any_failed tracked rather than letting `set -e` abort the whole
-          # step on the first exhausted-retries release — one release
-          # genuinely failing (distinct from the OTHER 5 succeeding) should
-          # still let the rest publish, same "ship what worked, fail loudly
-          # rather than silently" shape as the per-council build failures
-          # below. Checked, then surfaced as a real exit code at the end.
-          any_failed=0
           for nation_tag in england_wales:ew scotland:scotland; do
             nation="${nation_tag%%:*}"
             tagsuffix="${nation_tag#*:}"
             for p in $(seq 0 $((NUM_PARTITIONS - 1))); do
-              tag="title-tiles-latest-${tagsuffix}-${p}"
-              assets=("$ASSETS_DIR/$nation/$p"/*.json.gz)
-              if [ ! -e "${assets[0]}" ]; then
-                echo "No $nation partition $p shards produced - leaving $tag untouched rather than publishing it empty." >&2
+              prefix="title-tiles-latest-${tagsuffix}-${p}"
+              count=$(find "$ASSETS_DIR/$nation/$p" -name '*.json.gz' | wc -l)
+              if [ "$count" -eq 0 ]; then
+                echo "No $nation partition $p shards produced - leaving s3://$BUCKET/$prefix/ untouched." >&2
                 continue
               fi
-              publish_one_release "$tag" "Title boundary tiles — $nation (partition $p)" "${assets[@]}" || any_failed=1
+              echo "Publishing $count shard(s) to s3://$BUCKET/$prefix/"
+              aws s3 sync "$ASSETS_DIR/$nation/$p/" "s3://$BUCKET/$prefix/" \
+                --delete --exclude '*' --include '*.json.gz' \
+                --content-type application/gzip --only-show-errors
             done
           done
-          if [ "$any_failed" -eq 1 ]; then
-            echo "One or more releases failed to publish - see above for which. Any OTHER release that succeeded is still live; re-run this workflow to retry just the ones that didn't." >&2
-            exit 1
-          fi
+
+      - name: Invalidate CloudFront cache
+        if: inputs.dry_run != 'true' && inputs.council == '' && inputs.county == ''
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ vars.TITLE_TILES_CLOUDFRONT_DISTRIBUTION_ID }}" \
+            --paths "/*"
 
       - name: Scoped run — not publishing
         if: inputs.dry_run != 'true' && (inputs.council != '' || inputs.county != '')
         run: |
-          echo "council/county filter was set, so this run is verification-only — the live title-tiles-latest-{ew,scotland} releases were NOT touched. Run with both left blank to publish a real --all build." >&2
+          echo "council/county filter was set, so this run is verification-only — the live tiles in S3 were NOT touched. Run with both left blank to publish a real --all build." >&2
 
       # Surfaces a per-council failure as a red job (so it's never
       # silently missed) without having blocked the publish step above
@@ -422,5 +255,5 @@ jobs:
       - name: Fail the job if either nation had per-council build errors
         if: steps.build_ew.outcome == 'failure' || steps.build_scotland.outcome == 'failure'
         run: |
-          echo "One or both build steps above failed to parse some councils/counties — see their own logs for which ones and why. The release was still published with everything that DID parse correctly; this failure is just to make sure the gap doesn't go unnoticed." >&2
+          echo "One or both build steps above failed to parse some councils/counties — see their own logs for which ones and why. The tiles were still published with everything that DID parse correctly; this failure is just to make sure the gap doesn't go unnoticed." >&2
           exit 1
