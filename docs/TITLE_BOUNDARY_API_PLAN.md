@@ -1,6 +1,6 @@
 # StopSpotter — Title boundary lookup: on-demand plan
 
-> **Moved here from `jamspr95/stopspotter` (Oct 2026)**, split into this
+> **Moved here from the app repo (then `jamspr95/stopspotter`, since renamed/moved to `AireStop-Limited/StopSpotter`) in Oct 2026**, split into this
 > dedicated public repo so the build pipeline can stay public once the app
 > repo goes private — see this repo's README for why. References below to
 > `scripts/`, `.github/workflows/build-title-tiles.yml`, and this doc's own

@@ -4,7 +4,7 @@ Builds the UK title-boundary lookup tiles that power StopSpotter's
 on-demand "Look up title" admin feature. Scrapes HM Land Registry
 (England & Wales) and Registers of Scotland open data, parses it, and
 publishes gzipped NDJSON shards as GitHub Release assets that
-[StopSpotter](https://github.com/jamspr95/stopspotter)'s
+[StopSpotter](https://github.com/AireStop-Limited/StopSpotter)'s
 `lookup-title-boundary` Supabase Edge Function fetches at query time.
 
 ## Why this is a separate repo

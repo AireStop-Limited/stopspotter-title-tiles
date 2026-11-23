@@ -100,7 +100,7 @@ jobs:
           HAS_PAT: ${{ secrets.TITLE_TILES_RELEASE_PAT != '' }}
         run: |
           if [ "$HAS_PAT" != "true" ]; then
-            echo "TITLE_TILES_RELEASE_PAT repo secret is not set. The default GITHUB_TOKEN's own rate limit isn't enough to publish NUM_RELEASE_PARTITIONS x 2 nations' worth of individual release-asset uploads (3,900+ calls) - confirmed by a real run hitting '403 API rate limit exceeded for installation' partway through. See docs/SETUP.md §15 (in the jamspr95/stopspotter repo) for how to create a fine-grained PAT (Contents: Read & Write, scoped to only this repo) and add it here as this secret." >&2
+            echo "TITLE_TILES_RELEASE_PAT repo secret is not set. The default GITHUB_TOKEN's own rate limit isn't enough to publish NUM_RELEASE_PARTITIONS x 2 nations' worth of individual release-asset uploads (3,900+ calls) - confirmed by a real run hitting '403 API rate limit exceeded for installation' partway through. See docs/SETUP.md §15 (in the AireStop-Limited/StopSpotter repo) for how to create a fine-grained PAT (Contents: Read & Write, scoped to only this repo) and add it here as this secret." >&2
             exit 1
           fi
 
